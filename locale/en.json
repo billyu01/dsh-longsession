@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Long-session care",
+    "description": "Keeps a small, stable state card (goal, open todos, last human instruction, focused file) in the system prompt, and records per-request context pressure locally."
+  }
+}

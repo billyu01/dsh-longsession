@@ -1,0 +1,7 @@
+Third-party notice
+
+The `cordis.patch.yml` preset override reproduces the plugin list of the
+DeepSeek Harness `standard` agent preset, which is published by the
+DeepSeek Harness project under the MIT License. The override only adds the
+long-session governor row and adjusts two tool-result pruning budgets.
+Regenerate it for your installed DSH version with `python3 generate-preset.py`.

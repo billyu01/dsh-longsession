@@ -1,0 +1,47 @@
+{
+  "name": "dsh-longsession",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "DSH long-session care: task state card, working-set based incremental compaction, and context pressure telemetry. Short sessions are unaffected.",
+  "exports": {
+    ".": "./index.js",
+    "./governor": "./governor.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "governor.js",
+    "cordis.patch.yml",
+    "generate-preset.py",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "NOTICE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "author": "billyu01",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "compaction",
+    "long-context",
+    "context-management"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/billyu01/dsh-longsession.git"
+  },
+  "bugs": {
+    "url": "https://github.com/billyu01/dsh-longsession/issues"
+  },
+  "homepage": "https://github.com/billyu01/dsh-longsession#readme"
+}
