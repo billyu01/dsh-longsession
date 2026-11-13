@@ -29,22 +29,8 @@ GOVERNOR_ROW = """{indent}- id: longsession-governor
 {indent}    minGrowthRatio: 1
 """
 
-CARD_INSERT = """- insert:
-    - id: longsession
-      name: "dsh-longsession"
-      config:
-        # 短会话门槛：压力低于这个 token 数时完全不介入（不出卡片、不压缩）
-        minPressureTokens: 60000
-        minSteps: 6
-        minHumanMessages: 1
-        maxCardChars: 1200
-        reportEverySteps: 10
-        telemetryDir: ""
-"""
-
 HEADER = """# 本文件由 generate-preset.py 生成，不要手改。
-# 第一段：全局插入长会话状态卡插件（短会话完全无感）。
-# 第二段：覆盖官方 standard 预设，在压缩组里插入自适应增量压缩治理，并收紧工具结果修剪预算。
+# 覆盖官方 standard 预设：压缩组内插入自适应增量压缩治理，并收紧工具结果修剪预算。
 # DSH 升级后请重新运行：python3 generate-preset.py
 """
 
@@ -112,8 +98,7 @@ def main() -> int:
     parser.add_argument("--out", default=str(DEFAULT_OUT))
     args = parser.parse_args()
     shipped = extract_file(args.asar, SHIPPED)
-    override = build(shipped).replace(HEADER, "")
-    text = HEADER + CARD_INSERT + override
+    text = HEADER + build(shipped).replace(HEADER, "")
     Path(args.out).write_text(text, encoding="utf-8")
     print(f"已写入 {args.out}（{len(text.splitlines())} 行）")
     return 0

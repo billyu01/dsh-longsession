@@ -1,28 +1,24 @@
 /**
- * 自适应增量压缩治理（预设层插件，挂在 compaction 隔离组里）。
+ * 自适应增量压缩治理（挂在智能体预设的 compaction 隔离组里）。
  *
- * 为什么需要它：官方压缩只在窗口用满 80% 时触发，而且一次把最老的一大段
- * 历史替换成一条摘要。实测 36 次压缩里，中位数一次删掉 49 万 token、
- * 只换回 1.3 万字符摘要；压缩后模型反复重读文件、重跑命令。
+ * 官方压缩只在窗口用满 80% 时触发，而且一次把最老的一大段历史替换成摘要。
+ * 实测 36 次压缩里，中位数一次删掉 49 万 token、只换回 1.3 万字符摘要；
+ * 压缩后模型反复重读文件、重跑命令。本插件把压缩改造成：
  *
- * 本插件的策略（不使用固定窗口百分比）：
- * 1. 触发条件按「工作集」判断：工作集 = 系统提示 + 请求固定开销 +
- *    最近若干步的消息。上下文超过工作集的 slack 倍才考虑压缩。
- * 2. 只在轮次边界动手（每轮第一步），避免把任务状态从步骤中间切走。
+ * 1. 按「工作集」触发，而不是固定窗口百分比：
+ *      工作集 = 系统提示 + 请求固定开销 + 最近 recentNodes 个消息节点；
+ *      压力超过工作集的 slack 倍才考虑压缩。
+ * 2. 只在轮次边界动手（每轮第一步），避免从步骤中间切走任务状态。
  * 3. 每次只压最老的一段，把上下文压回工作集的 keepFactor 倍就停。
- * 4. 防抖：两次压缩之间至少 minStepsBetween 步，且新增量不足时不动。
- * 5. 官方 80% 阈值保留为安全兜底；本插件只做更早、更小步的压缩。
+ * 4. 防抖：两次压缩之间至少 minStepsBetween 步，且新增量达到工作集的一定倍数。
+ * 5. 官方 80% 阈值保留为安全兜底；接近窗口 90% 时本插件主动让位。
  *
- * 任何异常都只记录并放行，绝不打断本轮对话。
+ * 任何异常都只吞掉并放行，绝不打断本轮对话。
  */
-
-import { appendFileSync, mkdirSync } from 'node:fs'
-import { join } from 'node:path'
-import { homedir } from 'node:os'
 
 const DEFAULTS = {
   enabled: true,
-  /** 上下文超过工作集的多少倍才考虑压缩。 */
+  /** 压力超过工作集的多少倍才考虑压缩。 */
   slack: 3,
   /** 压缩后希望上下文回到工作集的多少倍。 */
   keepFactor: 1.5,
@@ -34,10 +30,6 @@ const DEFAULTS = {
   recentNodes: 12,
   /** 单次压缩最多释放当前上下文的多大比例。 */
   maxFreeRatio: 0.6,
-  /** 最近多少步内的相邻请求不重复记录「跳过」原因。 */
-  recordSkipWithinSteps: 20,
-  /** 观测目录，留空为 ~/.dsh/longsession-care。 */
-  telemetryDir: '',
 }
 
 const KNOWN_KEYS = new Set(Object.keys(DEFAULTS))
@@ -77,7 +69,7 @@ function normalizeConfig(ctx, rawConfig) {
       cfg[key] = value
     }
   }
-  for (const key of ['slack', 'keepFactor', 'minStepsBetween', 'minGrowthRatio', 'recentNodes', 'maxFreeRatio', 'recordSkipWithinSteps']) {
+  for (const key of ['slack', 'keepFactor', 'minStepsBetween', 'minGrowthRatio', 'recentNodes', 'maxFreeRatio']) {
     const numeric = Number(cfg[key])
     cfg[key] = Number.isFinite(numeric) ? numeric : DEFAULTS[key]
   }
@@ -88,7 +80,7 @@ function sessionState(sessions, session) {
   const id = String(session?.id ?? 'unknown')
   let state = sessions.get(id)
   if (state === undefined) {
-    state = { totalSteps: 0, lastCompactStep: -Infinity, lastTotalTokens: 0, lastSkipReason: '', lastSkipStep: -Infinity }
+    state = { totalSteps: 0, lastCompactStep: -Infinity, lastTotalTokens: 0 }
     sessions.set(id, state)
   }
   state.totalSteps += 1
@@ -101,12 +93,11 @@ async function govern(ctx, cfg, sessions, payload) {
   if (session === undefined) return
   const state = sessionState(sessions, session)
 
-  const meter = ctx.tokenMeter
   let pressureInfo
   let measurement
   try {
-    pressureInfo = meter.contextPressure(session)
-    measurement = meter.measure(session)
+    pressureInfo = ctx.tokenMeter.contextPressure(session)
+    measurement = ctx.tokenMeter.measure(session)
   } catch {
     return
   }
@@ -114,7 +105,7 @@ async function govern(ctx, cfg, sessions, payload) {
 
   const window = pressureInfo?.contextWindow
   const pressure = pressureInfo?.pressureTokens ?? measurement.totalTokens
-  const evaluation = evaluate({
+  const plan = evaluate({
     cfg,
     state,
     nodes: measurement.nodes,
@@ -123,88 +114,53 @@ async function govern(ctx, cfg, sessions, payload) {
     totalTokens: measurement.totalTokens,
     surfaceTokens: measurement.surfaceTokens,
   })
+  if (plan === null) return
 
-  if (evaluation.action !== 'compact') {
-    recordSkip(ctx, cfg, state, session, evaluation)
-    return
-  }
-
-  const before = { ...state }
-  const plan = evaluation.plan
   let endIdx = plan.endIdx
-  let error
   for (let attempt = 0; attempt < 6 && endIdx >= 2; attempt += 1) {
-    const startSeq = measurement.nodes[1].seq
-    const endSeq = measurement.nodes[endIdx].seq
     try {
-      await ctx.compaction.compactRegion(startSeq, endSeq, agent, payload.signal)
-      recordTelemetry(ctx, cfg, session, {
-        action: 'compact',
-        turn: payload.turn,
-        step: payload.step,
-        pressure: Math.round(pressure),
-        window,
-        workingSet: Math.round(evaluation.workingSet),
-        regionNodes: endIdx - 1 + 1,
-        regionTokens: Math.round(plan.regionTokens),
-        freedEstimate: Math.round(plan.regionTokens),
-        totalBefore: measurement.totalTokens,
-        ok: true,
-      })
+      await ctx.compaction.compactRegion(
+        measurement.nodes[1].seq,
+        measurement.nodes[endIdx].seq,
+        agent,
+        payload.signal,
+      )
       state.lastCompactStep = state.totalSteps
       state.lastTotalTokens = Math.max(0, measurement.totalTokens - plan.regionTokens)
-      state.lastSkipReason = ''
       return
-    } catch (caught) {
-      error = caught
+    } catch {
       endIdx -= 1
-      recordTelemetry(ctx, cfg, session, {
-        action: 'compact-retry',
-        turn: payload.turn,
-        step: payload.step,
-        endIdx,
-        reason: String(caught?.message ?? caught).slice(0, 240),
-      })
     }
   }
-  state.lastCompactStep = before.lastCompactStep
-  recordTelemetry(ctx, cfg, session, {
-    action: 'compact-failed',
-    turn: payload.turn,
-    step: payload.step,
-    reason: String(error?.message ?? error ?? '没有可用的平衡切点').slice(0, 240),
-  })
 }
 
 /**
- * 纯决策函数，便于单元测试。
- * @returns {{action:'skip', reason:string} | {action:'compact', workingSet:number, plan:{startIdx:number,endIdx:number,regionTokens:number}}}
+ * 纯决策函数：返回 null 表示不压缩，否则返回要压缩的尾部索引与预计释放量。
+ * @returns {null | {startIdx:number, endIdx:number, regionTokens:number}}
  */
 export function evaluate({ cfg, state, nodes, pressure, window, totalTokens, surfaceTokens }) {
-  if (!Number.isFinite(window) || window <= 0) return { action: 'skip', reason: 'no-window' }
-  if (!Number.isFinite(pressure) || pressure <= 0) return { action: 'skip', reason: 'no-pressure' }
+  if (!Number.isFinite(window) || window <= 0) return null
+  if (!Number.isFinite(pressure) || pressure <= 0) return null
 
   const overhead = Math.max(0, (totalTokens ?? 0) - (surfaceTokens ?? 0))
   const recent = sumTail(nodes, cfg.recentNodes)
   const systemTokens = nodes[0]?.tokens ?? 0
   const workingSet = systemTokens + overhead + recent
-  if (workingSet <= 0) return { action: 'skip', reason: 'no-working-set' }
+  if (workingSet <= 0) return null
 
-  if (pressure > window * 0.9) return { action: 'skip', reason: 'overflow-guard' }
-  if (pressure <= workingSet * cfg.slack) return { action: 'skip', reason: 'below-slack' }
-  if (state.totalSteps - state.lastCompactStep < cfg.minStepsBetween) return { action: 'skip', reason: 'cooldown' }
+  if (pressure > window * 0.9) return null
+  if (pressure <= workingSet * cfg.slack) return null
+  if (state.totalSteps - state.lastCompactStep < cfg.minStepsBetween) return null
   if (state.lastTotalTokens > 0) {
     const growth = (totalTokens ?? pressure) - state.lastTotalTokens
-    if (growth < workingSet * cfg.minGrowthRatio) return { action: 'skip', reason: 'growth-too-small' }
+    if (growth < workingSet * cfg.minGrowthRatio) return null
   }
   const keepBudget = workingSet * cfg.keepFactor
   const targetFree = pressure - keepBudget
-  if (targetFree < workingSet) return { action: 'skip', reason: 'relief-too-small' }
+  if (targetFree < workingSet) return null
 
   const maxFree = Math.min(pressure * cfg.maxFreeRatio, window * 0.5)
-  const plan = chooseRegion(nodes, keepBudget, maxFree)
-  if (plan === null) return { action: 'skip', reason: 'no-balanced-region' }
-  return { action: 'compact', workingSet, plan }
+  return chooseRegion(nodes, keepBudget, maxFree)
 }
 
 /** 从尾部保留 keepBudget，向前找最老的可压缩区间；释放量不超过 maxFree。 */
@@ -234,32 +190,6 @@ function sumTail(nodes, count) {
   const from = Math.max(1, nodes.length - Math.max(1, count))
   for (let index = from; index < nodes.length; index += 1) total += nodes[index]?.tokens ?? 0
   return total
-}
-
-function recordSkip(ctx, cfg, state, session, evaluation) {
-  const reason = evaluation.reason
-  if (state.lastSkipReason === reason && state.totalSteps - state.lastSkipStep < cfg.recordSkipWithinSteps) return
-  state.lastSkipReason = reason
-  state.lastSkipStep = state.totalSteps
-  recordTelemetry(ctx, cfg, session, { action: 'skip', reason, totalSteps: state.totalSteps })
-}
-
-function recordTelemetry(ctx, cfg, session, record) {
-  const dir = resolveTelemetryDir(cfg.telemetryDir)
-  if (dir === '') return
-  try {
-    mkdirSync(dir, { recursive: true })
-    const line = { ts: new Date().toISOString(), session: String(session?.id ?? ''), ...record }
-    appendFileSync(join(dir, 'governor.jsonl'), JSON.stringify(line) + '\n', 'utf8')
-  } catch {
-    /* 观测失败不影响会话 */
-  }
-}
-
-function resolveTelemetryDir(configured) {
-  if (typeof configured === 'string' && configured.trim().length > 0) return configured.trim()
-  const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
-  return join(home, 'longsession-care')
 }
 
 export const __test = { DEFAULTS }

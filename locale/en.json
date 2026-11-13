@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Long-session care",
-    "description": "Keeps a small, stable state card (goal, open todos, last human instruction, focused file) in the system prompt, and records per-request context pressure locally."
+    "title": "Long-session compaction governor",
+    "description": "Adaptive incremental compaction for DSH: triggers by working-set size, compacts only at turn boundaries in small steps, and throttles repeat compactions. Short sessions are unaffected."
   }
 }

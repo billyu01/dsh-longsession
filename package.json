@@ -1,17 +1,15 @@
 {
   "name": "dsh-longsession",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
-  "description": "DSH long-session care: task state card, working-set based incremental compaction, and context pressure telemetry. Short sessions are unaffected.",
+  "description": "DSH long-session compaction governor: triggers by working-set size instead of a fixed window percentage, compacts only at turn boundaries in small increments, and throttles repeat compactions. Short sessions are unaffected.",
   "exports": {
-    ".": "./index.js",
     "./governor": "./governor.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
     "./package.json": "./package.json"
   },
   "files": [
-    "index.js",
     "governor.js",
     "cordis.patch.yml",
     "generate-preset.py",
