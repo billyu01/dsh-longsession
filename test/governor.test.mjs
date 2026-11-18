@@ -5,10 +5,11 @@ import { evaluate, chooseRegion } from '../governor.js'
 const CFG = {
   slack: 3,
   keepFactor: 1.5,
-  minStepsBetween: 25,
+  minStepsBetween: 60,
   minGrowthRatio: 1,
-  recentNodes: 12,
+  maxFreeWorkSets: 2,
   maxFreeRatio: 0.6,
+  recentNodes: 12,
 }
 
 const freshState = (overrides = {}) => ({ totalSteps: 100, lastCompactStep: -Infinity, lastTotalTokens: 0, ...overrides })
@@ -20,45 +21,79 @@ function makeNodes({ count = 41, head = 2000, each = 2425 } = {}) {
 }
 
 const surfaceOf = (nodes) => nodes.reduce((sum, n) => sum + n.tokens, 0)
+const workingSetOf = (nodes) => {
+  const surface = surfaceOf(nodes)
+  const total = surface + 1000
+  const recent = nodes.slice(-12).reduce((sum, n) => sum + n.tokens, 0)
+  return nodes[0].tokens + (total - surface) + recent
+}
 
-test('没有窗口信息时不行动', () => {
-  assert.equal(evaluate({ cfg: CFG, state: freshState(), nodes: makeNodes(), pressure: 100000, window: undefined, totalTokens: 100000, surfaceTokens: 99000 }), null)
+test('没有窗口信息时跳过', () => {
+  const result = evaluate({ cfg: CFG, state: freshState(), nodes: makeNodes(), pressure: 100000, window: undefined, totalTokens: 100000, surfaceTokens: 99000 })
+  assert.equal(result.action, 'skip')
+  assert.equal(result.reason, 'no-window')
 })
 
-test('低于工作集倍数时不行动', () => {
+test('低于工作集倍数时跳过', () => {
   const nodes = makeNodes()
   const surface = surfaceOf(nodes)
-  assert.equal(evaluate({ cfg: CFG, state: freshState(), nodes, pressure: 60000, window: 200000, totalTokens: surface + 1000, surfaceTokens: surface }), null)
+  const result = evaluate({ cfg: CFG, state: freshState(), nodes, pressure: 60000, window: 200000, totalTokens: surface + 1000, surfaceTokens: surface })
+  assert.equal(result.action, 'skip')
+  assert.equal(result.reason, 'below-slack')
 })
 
-test('冷却期内不行动', () => {
+test('冷却按真实步数计，不足 60 步跳过', () => {
   const nodes = makeNodes()
   const surface = surfaceOf(nodes)
-  assert.equal(evaluate({ cfg: CFG, state: freshState({ lastCompactStep: 90 }), nodes, pressure: 150000, window: 200000, totalTokens: surface + 1000, surfaceTokens: surface }), null)
+  const result = evaluate({ cfg: CFG, state: freshState({ totalSteps: 100, lastCompactStep: 50 }), nodes, pressure: 150000, window: 200000, totalTokens: surface + 1000, surfaceTokens: surface })
+  assert.equal(result.action, 'skip')
+  assert.equal(result.reason, 'cooldown')
+})
+
+test('冷却满足后可以压缩', () => {
+  const nodes = makeNodes()
+  const surface = surfaceOf(nodes)
+  const result = evaluate({ cfg: CFG, state: freshState({ totalSteps: 100, lastCompactStep: 40 }), nodes, pressure: 150000, window: 300000, totalTokens: surface + 1000, surfaceTokens: surface })
+  assert.equal(result.action, 'compact')
 })
 
 test('接近溢出时交给官方兜底', () => {
   const nodes = makeNodes()
   const surface = surfaceOf(nodes)
-  assert.equal(evaluate({ cfg: CFG, state: freshState(), nodes, pressure: 190000, window: 200000, totalTokens: surface + 1000, surfaceTokens: surface }), null)
+  const result = evaluate({ cfg: CFG, state: freshState(), nodes, pressure: 190000, window: 200000, totalTokens: surface + 1000, surfaceTokens: surface })
+  assert.equal(result.action, 'skip')
+  assert.equal(result.reason, 'overflow-guard')
 })
 
-test('满足条件时给出增量压缩区间', () => {
+test('满足条件时给出增量压缩区间，且不超过工作集两倍', () => {
   const nodes = makeNodes()
   const surface = surfaceOf(nodes)
-  const plan = evaluate({ cfg: CFG, state: freshState(), nodes, pressure: 160000, window: 300000, totalTokens: surface + 1000, surfaceTokens: surface })
-  assert.ok(plan !== null)
-  assert.equal(plan.startIdx, 1)
-  assert.ok(plan.endIdx >= 2)
-  assert.ok(plan.regionTokens <= 160000 * 0.6 + 1)
-  assert.ok(plan.regionTokens > 0)
+  const workingSet = workingSetOf(nodes)
+  const result = evaluate({ cfg: CFG, state: freshState(), nodes, pressure: 160000, window: 300000, totalTokens: surface + 1000, surfaceTokens: surface })
+  assert.equal(result.action, 'compact')
+  assert.equal(result.plan.startIdx, 1)
+  assert.ok(result.plan.endIdx >= 2)
+  assert.ok(result.plan.regionTokens <= workingSet * 2)
+  assert.ok(result.plan.regionTokens > 0)
 })
 
-test('增长不足时不行动', () => {
+test('压力很大时单次释放仍被工作集上限压住', () => {
+  const nodes = makeNodes()
+  const surface = surfaceOf(nodes)
+  const workingSet = workingSetOf(nodes)
+  const result = evaluate({ cfg: CFG, state: freshState({ totalSteps: 400 }), nodes, pressure: 450000, window: 1000000, totalTokens: surface + 1000, surfaceTokens: surface })
+  assert.equal(result.action, 'compact')
+  assert.ok(result.plan.regionTokens <= workingSet * 2)
+  assert.ok(result.plan.regionTokens <= 450000 * 0.6)
+})
+
+test('增长不足时跳过', () => {
   const nodes = makeNodes()
   const surface = surfaceOf(nodes)
   const total = surface + 1000
-  assert.equal(evaluate({ cfg: CFG, state: freshState({ lastTotalTokens: total - 1000 }), nodes, pressure: total, window: 300000, totalTokens: total, surfaceTokens: surface }), null)
+  const result = evaluate({ cfg: CFG, state: freshState({ lastTotalTokens: total - 1000 }), nodes, pressure: total, window: 300000, totalTokens: total, surfaceTokens: surface })
+  assert.equal(result.action, 'skip')
+  assert.equal(result.reason, 'growth-too-small')
 })
 
 test('区间选择：保留尾部、起点固定为 1、释放量受限', () => {
