@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { evaluate, chooseRegion } from '../governor.js'
+import { evaluate, chooseRegion, shouldCheck } from '../governor.js'
 
 const CFG = {
   slack: 3,
@@ -10,6 +10,8 @@ const CFG = {
   maxFreeWorkSets: 2,
   maxFreeRatio: 0.6,
   recentNodes: 12,
+  minPressureTokens: 1,
+  emergencyRatio: 0.6,
 }
 
 const freshState = (overrides = {}) => ({ totalSteps: 100, lastCompactStep: -Infinity, lastTotalTokens: 0, ...overrides })
@@ -107,4 +109,22 @@ test('区间选择：保留尾部、起点固定为 1、释放量受限', () => 
 test('无有效切点时返回 null', () => {
   assert.equal(chooseRegion(makeNodes({ count: 4 }), 999999, 60000), null)
   assert.equal(chooseRegion([], 100, 100), null)
+})
+
+test('低于绝对压力门槛时跳过', () => {
+  const nodes = makeNodes()
+  const surface = surfaceOf(nodes)
+  const cfg = { ...CFG, minPressureTokens: 250000 }
+  const result = evaluate({ cfg, state: freshState(), nodes, pressure: 200000, window: 1000000, totalTokens: surface + 1000, surfaceTokens: surface })
+  assert.equal(result.action, 'skip')
+  assert.equal(result.reason, 'below-floor')
+})
+
+test('边界判断：轮首、紧急压力、其余时刻', () => {
+  assert.equal(shouldCheck({ step: 1, turn: 2, pressure: 100000, window: 1000000, emergencyRatio: 0.6 }), true)
+  assert.equal(shouldCheck({ step: 7, turn: 1, pressure: 700000, window: 1000000, emergencyRatio: 0.6 }), true)
+  assert.equal(shouldCheck({ step: 7, turn: 3, pressure: 300000, window: 1000000, emergencyRatio: 0.6 }), false)
+  assert.equal(shouldCheck({ step: 1, turn: 1, pressure: 100000, window: 1000000, emergencyRatio: 0.6 }), false)
+  assert.equal(shouldCheck({ step: 7, turn: 1, pressure: 700000, window: 1000000, emergencyRatio: 0 }), false)
+  assert.equal(shouldCheck({ step: 7, turn: 1, pressure: undefined, window: 1000000, emergencyRatio: 0.6 }), false)
 })

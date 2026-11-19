@@ -32,6 +32,10 @@ const DEFAULTS = {
   maxFreeWorkSets: 2,
   /** 单次压缩最多释放当前上下文的多大比例。 */
   maxFreeRatio: 0.6,
+  /** 绝对最低压力门槛：低于这个 token 数一律不压，避免小会话被无谓压缩。 */
+  minPressureTokens: 250000,
+  /** 压力超过窗口这个比例时，允许在一轮中间的步边界压缩（解决长首轮问题）。 */
+  emergencyRatio: 0.6,
   /** 估算工作集时保留最近多少个消息节点。 */
   recentNodes: 12,
   /** 打开后每个决策写一行 Host 日志（默认关闭，不写文件、不进上下文）。 */
@@ -54,9 +58,22 @@ export function apply(ctx, rawConfig) {
       if (session === undefined) return next()
       // 每次请求前都计数，冷却单位因此是真实步数而不是轮次。
       const state = sessionState(sessions, session)
-      if (payload?.step === 1 && Number(payload?.turn) > 1 && payload?.signal?.aborted !== true) {
-        await govern(ctx, cfg, state, payload)
-      }
+      if (payload?.signal?.aborted === true) return next()
+      const info = readPressure(ctx, session)
+      const pressure = info?.pressureTokens
+      const window = info?.contextWindow
+      const check = shouldCheck({
+        step: payload?.step,
+        turn: payload?.turn,
+        pressure,
+        window,
+        emergencyRatio: cfg.emergencyRatio,
+      })
+      if (!check) return next()
+      // 便宜的前置过滤：低于绝对门槛或还在冷却期，不进入昂贵的 measure()。
+      if (Number.isFinite(pressure) && pressure < cfg.minPressureTokens) return next()
+      if (state.totalSteps - state.lastCompactStep < cfg.minStepsBetween) return next()
+      await govern(ctx, cfg, state, payload)
     } catch {
       /* 治理失败不影响本轮 */
     }
@@ -79,7 +96,7 @@ function normalizeConfig(ctx, rawConfig) {
       cfg[key] = value
     }
   }
-  for (const key of ['slack', 'keepFactor', 'minStepsBetween', 'minGrowthRatio', 'maxFreeWorkSets', 'maxFreeRatio', 'recentNodes']) {
+  for (const key of ['slack', 'keepFactor', 'minStepsBetween', 'minGrowthRatio', 'maxFreeWorkSets', 'maxFreeRatio', 'recentNodes', 'minPressureTokens', 'emergencyRatio']) {
     const numeric = Number(cfg[key])
     cfg[key] = Number.isFinite(numeric) ? numeric : DEFAULTS[key]
   }
@@ -180,6 +197,28 @@ function debug(ctx, cfg, state, session, record) {
 }
 
 /**
+ * 判断这一刻要不要进入治理检查。
+ * 正常只在「第 2 轮起的每轮第一步」检查；当压力超过窗口的 emergencyRatio 时，
+ * 允许在一轮中间的任意步边界检查，避免长首轮把上下文推过理想水位。
+ * @returns 是否检查
+ */
+export function shouldCheck({ step, turn, pressure, window, emergencyRatio }) {
+  if (step === 1 && Number(turn) > 1) return true
+  if (Number.isFinite(emergencyRatio) && emergencyRatio > 0 && Number.isFinite(window) && window > 0 && Number.isFinite(pressure)) {
+    return pressure > window * emergencyRatio
+  }
+  return false
+}
+
+function readPressure(ctx, session) {
+  try {
+    return ctx.tokenMeter?.contextPressure?.(session)
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * 纯决策函数。
  * @returns {{action:'skip', reason:string} | {action:'compact', workingSet:number, plan:{startIdx:number,endIdx:number,regionTokens:number}}}
  */
@@ -193,6 +232,7 @@ export function evaluate({ cfg, state, nodes, pressure, window, totalTokens, sur
   const workingSet = systemTokens + overhead + recent
   if (workingSet <= 0) return { action: 'skip', reason: 'no-working-set' }
 
+  if (pressure < cfg.minPressureTokens) return { action: 'skip', reason: 'below-floor' }
   if (pressure > window * 0.9) return { action: 'skip', reason: 'overflow-guard' }
   if (pressure <= workingSet * cfg.slack) return { action: 'skip', reason: 'below-slack' }
   if (state.totalSteps - state.lastCompactStep < cfg.minStepsBetween) return { action: 'skip', reason: 'cooldown' }

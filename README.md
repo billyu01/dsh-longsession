@@ -10,7 +10,7 @@ DSH（DeepSeek Harness）长会话压缩治理插件。
 
 ## 工作方式
 
-每次请求前（只在每轮第一步执行压缩检查）：
+每次请求前都会做一次便宜的检查；正常只在「第 2 轮起的每轮第一步」进入压缩决策，但当压力超过窗口的 `emergencyRatio`（默认 60%）时，允许在一轮中间的任意步边界进入决策——避免一个很长的首轮把上下文推过理想水位。
 
 ```text
 工作集 = 系统提示 token + 请求固定开销 + 最近 12 个消息节点的 token
@@ -18,6 +18,7 @@ DSH（DeepSeek Harness）长会话压缩治理插件。
 
 满足全部条件才压缩：
 
+0. 压力 ≥ `minPressureTokens`（默认 250,000，低于它一律不压，避免小会话被无谓压缩）；
 1. 压力不超过窗口的 90%（接近溢出时让位给官方兜底）；
 2. 压力 > 工作集 × `slack`（默认 3 倍）；
 3. 距上次压缩 ≥ `minStepsBetween` 个模型请求步（默认 60，按每次请求前计数，不是按轮）；
@@ -75,13 +76,16 @@ plugin_manager install_bundle target: github:billyu01/dsh-longsession
     maxFreeWorkSets: 2    # 单次释放上限（相对工作集）
     maxFreeRatio: 0.6     # 单次释放上限（相对当前压力）
     recentNodes: 12       # 估算工作集时保留的近期节点数
+    minPressureTokens: 250000  # 绝对最低压力门槛
+    emergencyRatio: 0.6   # 压力超过窗口这个比例时，允许在任意步边界压缩
     debug: false          # 打开后每次决策写一行 Host 日志（默认关闭）
 ```
 
 ### 调参建议
 
 - **压缩太频繁**：加大 `minStepsBetween`（比如 80～120），或减小 `maxFreeWorkSets` 让每次压得更少但更勤。
-- **上下文降不下来**：加大 `slack` 没有意义，应该加大 `maxFreeWorkSets`（比如 3）或减小 `keepFactor`。
+- **小会话被无谓压缩**：加大 `minPressureTokens`（比如 300000～400000）。
+- **上下文降不下来**：加大 `maxFreeWorkSets`（比如 3）或减小 `keepFactor`；长首轮压不到时把 `emergencyRatio` 调低（比如 0.5）。
 - **想看它到底做了什么**：临时把 `debug` 设为 `true`，日志里会出现 `longsession-governor: {...}` 一行（只在 Host 日志中，不写文件、不进模型上下文）。
 
 ## 覆盖官方预设的代价
@@ -106,6 +110,7 @@ node --test test/governor.test.mjs
 
 ## 变更记录
 
+- `v2.2.0`：新增绝对最低压力门槛 `minPressureTokens`（默认 250,000）；压力超过窗口 60% 时允许在任意步边界压缩（解决长首轮压不到的问题）。
 - `v2.1.1`：图标改成与 DSH 官方插件一致的 36×36、渐变填充、圆角风格。
 - `v2.1.0`：冷却改为按真实请求步数（默认 60）；单次释放增加「工作集 × 2」绝对上限；新增默认关闭的 `debug` 日志。
 - `v2.0.0`：只保留压缩治理，移除状态卡、`/care` 与遥测文件。

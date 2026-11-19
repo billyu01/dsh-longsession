@@ -1,6 +1,6 @@
 {
   "name": "dsh-longsession",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "type": "module",
   "description": "DSH long-session compaction governor: triggers by working-set size instead of a fixed window percentage, compacts only at turn boundaries in small increments, and throttles repeat compactions. Short sessions are unaffected.",
   "exports": {
