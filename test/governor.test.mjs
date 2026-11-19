@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { evaluate, chooseRegion, shouldCheck } from '../governor.js'
+import { evaluate, chooseRegion, shouldCheck, findOriginalRequestStart, initializeState } from '../governor.js'
 
 const CFG = {
   slack: 3,
@@ -12,6 +12,7 @@ const CFG = {
   recentNodes: 12,
   minPressureTokens: 1,
   emergencyRatio: 0.6,
+  minFreeTokens: 1,
 }
 
 const freshState = (overrides = {}) => ({ totalSteps: 100, lastCompactStep: -Infinity, lastTotalTokens: 0, ...overrides })
@@ -127,4 +128,37 @@ test('边界判断：轮首、紧急压力、其余时刻', () => {
   assert.equal(shouldCheck({ step: 1, turn: 1, pressure: 100000, window: 1000000, emergencyRatio: 0.6 }), false)
   assert.equal(shouldCheck({ step: 7, turn: 1, pressure: 700000, window: 1000000, emergencyRatio: 0 }), false)
   assert.equal(shouldCheck({ step: 7, turn: 1, pressure: undefined, window: 1000000, emergencyRatio: 0.6 }), false)
+})
+
+test('预计释放量低于收益门槛时跳过', () => {
+  const nodes = makeNodes()
+  const surface = surfaceOf(nodes)
+  const cfg = { ...CFG, minFreeTokens: 100000 }
+  const result = evaluate({ cfg, state: freshState(), nodes, pressure: 160000, window: 300000, totalTokens: surface + 1000, surfaceTokens: surface })
+  assert.equal(result.action, 'skip')
+  assert.equal(result.reason, 'benefit-too-small')
+})
+
+test('原始人类请求之后才开始压缩区间', () => {
+  const nodes = [{ seq: 10, tokens: 2000 }, { seq: 11, tokens: 100 }, { seq: 12, tokens: 3000 }, { seq: 13, tokens: 500 }]
+  const human = { type: 'user/message', data: { source: { kind: 'user' } } }
+  const tool = { type: 'tool/result', data: {} }
+  const session = { eventAt: (seq) => (seq === 11 ? human : tool) }
+  assert.equal(findOriginalRequestStart(session, nodes), 2)
+  assert.equal(findOriginalRequestStart({ eventAt: () => tool }, nodes), 1)
+  assert.equal(findOriginalRequestStart({ eventAt: () => { throw new Error('x') } }, nodes), 1)
+})
+
+test('初始化时从日志恢复步数与上次压缩位置', () => {
+  const log = [
+    { type: 'step/start' }, { type: 'step/start' }, { type: 'step/start' },
+    { type: 'compaction/start', data: {} }, { type: 'compaction/summary', data: {} },
+    { type: 'step/start' }, { type: 'step/start' },
+  ]
+  const session = { log }
+  const state = initializeState({ initialized: false, totalSteps: 0, lastCompactStep: -Infinity, lastAttemptStep: -Infinity, lastTotalTokens: 0 }, session)
+  assert.equal(state.totalSteps, 5)
+  assert.equal(state.lastCompactStep, 3)
+  assert.equal(state.lastAttemptStep, 3)
+  assert.equal(initializeState({ initialized: false, totalSteps: 0, lastCompactStep: -Infinity, lastAttemptStep: -Infinity, lastTotalTokens: 0 }, { log: [] }).totalSteps, 0)
 })

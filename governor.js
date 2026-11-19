@@ -1,21 +1,12 @@
 /**
  * 自适应增量压缩治理（挂在智能体预设的 compaction 隔离组里）。
  *
- * 官方压缩只在窗口用满 80% 时触发，而且一次把最老的一大段历史替换成摘要。
- * 实测 36 次压缩里，中位数一次删掉 49 万 token、只换回 1.3 万字符摘要。
- * 本插件把压缩改造成：
- *
- * 1. 按「工作集」触发，而不是固定窗口百分比：
- *      工作集 = 系统提示 + 请求固定开销 + 最近 recentNodes 个消息节点；
- *      压力超过工作集的 slack 倍才考虑压缩。
- * 2. 只在轮次边界动手（每轮第一步），避免从步骤中间切走任务状态。
- * 3. 每次只压最老的一段，且单次释放量有绝对上限：
- *      不超过 工作集 × maxFreeWorkSets（默认 2 倍）；
- *      同时不超过 压力 × maxFreeRatio 与 窗口 × 0.5。
- * 4. 防抖按真实请求步数计：两次压缩之间至少 minStepsBetween 步（默认 60）。
- * 5. 官方 80% 阈值保留为安全兜底；接近窗口 90% 时本插件主动让位。
- *
- * 任何异常都只吞掉并放行，绝不打断本轮对话。
+ * 目标：把官方「一次删几十万 token」的压缩，改造成按工作集触发、小步、可防抖、
+ * 有收益门槛、有耗时预算的增量压缩。四条约束：
+ * 1. 合理策略：按工作集而不是固定窗口比例决定；只在安全边界动手。
+ * 2. 成本收益：预计释放量低于 minFreeTokens 不压；单次释放有上限；不新增任何模型调用。
+ * 3. 不影响 agent：所有异常吞掉放行；压缩失败/超时都不打断本轮；只走官方事务。
+ * 4. 不长时间耗时：每次压缩带 maxLatencyMs 时间预算，超时即放弃；失败后有重试退避。
  */
 
 const DEFAULTS = {
@@ -32,13 +23,19 @@ const DEFAULTS = {
   maxFreeWorkSets: 2,
   /** 单次压缩最多释放当前上下文的多大比例。 */
   maxFreeRatio: 0.6,
-  /** 绝对最低压力门槛：低于这个 token 数一律不压，避免小会话被无谓压缩。 */
-  minPressureTokens: 250000,
-  /** 压力超过窗口这个比例时，允许在一轮中间的步边界压缩（解决长首轮问题）。 */
-  emergencyRatio: 0.6,
   /** 估算工作集时保留最近多少个消息节点。 */
   recentNodes: 12,
-  /** 打开后每个决策写一行 Host 日志（默认关闭，不写文件、不进上下文）。 */
+  /** 绝对最低压力门槛：低于这个 token 数一律不压。 */
+  minPressureTokens: 250000,
+  /** 压力超过窗口这个比例时，允许在一轮中间的步边界压缩。 */
+  emergencyRatio: 0.6,
+  /** 收益门槛：预计释放量低于这个 token 数就不压（摘要调用不便宜）。 */
+  minFreeTokens: 50000,
+  /** 单次压缩的时间预算；超时放弃本次，不提交、不阻塞更久。 */
+  maxLatencyMs: 15000,
+  /** 压缩失败或超时后，至少再过多少步才重试，避免连续卡顿。 */
+  retryAfterFailureSteps: 30,
+  /** 打开后每次决策写一行 Host 日志（默认关闭，不写文件、不进上下文）。 */
   debug: false,
 }
 
@@ -56,23 +53,19 @@ export function apply(ctx, rawConfig) {
     try {
       const session = payload?.agent?.session
       if (session === undefined) return next()
-      // 每次请求前都计数，冷却单位因此是真实步数而不是轮次。
       const state = sessionState(sessions, session)
+      if (state.initialized !== true) initializeState(state, session)
+      state.totalSteps += 1
+
       if (payload?.signal?.aborted === true) return next()
       const info = readPressure(ctx, session)
       const pressure = info?.pressureTokens
       const window = info?.contextWindow
-      const check = shouldCheck({
-        step: payload?.step,
-        turn: payload?.turn,
-        pressure,
-        window,
-        emergencyRatio: cfg.emergencyRatio,
-      })
-      if (!check) return next()
-      // 便宜的前置过滤：低于绝对门槛或还在冷却期，不进入昂贵的 measure()。
+      if (!shouldCheck({ step: payload?.step, turn: payload?.turn, pressure, window, emergencyRatio: cfg.emergencyRatio })) return next()
+      // 便宜的前置过滤：避免进入昂贵的 measure() 与摘要调用。
       if (Number.isFinite(pressure) && pressure < cfg.minPressureTokens) return next()
       if (state.totalSteps - state.lastCompactStep < cfg.minStepsBetween) return next()
+      if (state.totalSteps - state.lastAttemptStep < cfg.retryAfterFailureSteps) return next()
       await govern(ctx, cfg, state, payload)
     } catch {
       /* 治理失败不影响本轮 */
@@ -96,7 +89,7 @@ function normalizeConfig(ctx, rawConfig) {
       cfg[key] = value
     }
   }
-  for (const key of ['slack', 'keepFactor', 'minStepsBetween', 'minGrowthRatio', 'maxFreeWorkSets', 'maxFreeRatio', 'recentNodes', 'minPressureTokens', 'emergencyRatio']) {
+  for (const key of ['slack', 'keepFactor', 'minStepsBetween', 'minGrowthRatio', 'maxFreeWorkSets', 'maxFreeRatio', 'recentNodes', 'minPressureTokens', 'emergencyRatio', 'minFreeTokens', 'maxLatencyMs', 'retryAfterFailureSteps']) {
     const numeric = Number(cfg[key])
     cfg[key] = Number.isFinite(numeric) ? numeric : DEFAULTS[key]
   }
@@ -108,10 +101,34 @@ function sessionState(sessions, session) {
   const id = String(session?.id ?? 'unknown')
   let state = sessions.get(id)
   if (state === undefined) {
-    state = { totalSteps: 0, lastCompactStep: -Infinity, lastTotalTokens: 0 }
+    state = {
+      initialized: false,
+      totalSteps: 0,
+      lastCompactStep: -Infinity,
+      lastAttemptStep: -Infinity,
+      lastTotalTokens: 0,
+    }
     sessions.set(id, state)
   }
-  state.totalSteps += 1
+  return state
+}
+
+/** 从会话日志恢复进度：进程重启后冷却不会清零，也不会把已压缩过的会话立刻再压一次。 */
+export function initializeState(state, session) {
+  state.initialized = true
+  const log = Array.isArray(session?.log) ? session.log : []
+  let steps = 0
+  let stepsAtSummary = null
+  let stepsAtStart = null
+  for (const event of log) {
+    if (event === null || typeof event !== 'object') continue
+    if (event.type === 'step/start') steps += 1
+    else if (event.type === 'compaction/summary') stepsAtSummary = steps
+    else if (event.type === 'compaction/start') stepsAtStart = steps
+  }
+  state.totalSteps = steps
+  if (stepsAtSummary !== null) state.lastCompactStep = stepsAtSummary
+  if (stepsAtStart !== null) state.lastAttemptStep = stepsAtStart
   return state
 }
 
@@ -145,38 +162,83 @@ async function govern(ctx, cfg, state, payload) {
   }
 
   const plan = evaluation.plan
+  // 原始人类请求不进入压缩区间：保留最开头那条需求原文。
+  const startIdx = findOriginalRequestStart(session, measurement.nodes)
+  if (startIdx >= plan.endIdx) return
+  const freedTokens = regionTokensOf(measurement.nodes, startIdx, plan.endIdx)
+  if (freedTokens < cfg.minFreeTokens) {
+    debug(ctx, cfg, state, session, {
+      action: 'skip',
+      reason: 'benefit-too-small',
+      pressure,
+      workingSet: evaluation.workingSet,
+      freedTokens,
+    })
+    return
+  }
+
   let endIdx = plan.endIdx
   let lastError
-  for (let attempt = 0; attempt < 6 && endIdx >= 2; attempt += 1) {
-    try {
-      await ctx.compaction.compactRegion(
-        measurement.nodes[1].seq,
-        measurement.nodes[endIdx].seq,
-        agent,
-        payload.signal,
-      )
+  for (let attempt = 0; attempt < 6 && endIdx > startIdx; attempt += 1) {
+    const result = await attemptCompact(ctx, cfg, payload, measurement, startIdx, endIdx)
+    if (result.ok) {
       state.lastCompactStep = state.totalSteps
-      state.lastTotalTokens = Math.max(0, measurement.totalTokens - plan.regionTokens)
+      state.lastAttemptStep = state.totalSteps
+      state.lastTotalTokens = Math.max(0, measurement.totalTokens - freedTokens)
       debug(ctx, cfg, state, session, {
         action: 'compact',
         pressure,
         workingSet: evaluation.workingSet,
-        regionTokens: plan.regionTokens,
-        regionNodes: plan.endIdx,
+        freedTokens,
+        startIdx,
+        endIdx,
         window,
       })
       return
-    } catch (caught) {
-      lastError = caught
-      endIdx -= 1
     }
+    lastError = result.error
+    if (result.timedOut) break
+    endIdx -= 1
   }
+  state.lastAttemptStep = state.totalSteps
   debug(ctx, cfg, state, session, {
     action: 'compact-failed',
     pressure,
     workingSet: evaluation.workingSet,
     reason: String(lastError?.message ?? lastError ?? '没有可用的平衡切点').slice(0, 200),
   })
+}
+
+/** 用带时间预算的信号调用官方压缩事务；超时/失败都只返回结果，不抛出。 */
+async function attemptCompact(ctx, cfg, payload, measurement, startIdx, endIdx) {
+  const controller = new AbortController()
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, Math.max(1000, cfg.maxLatencyMs))
+  const onAbort = () => controller.abort()
+  try {
+    payload.signal?.addEventListener?.('abort', onAbort, { once: true })
+    await ctx.compaction.compactRegion(
+      measurement.nodes[startIdx].seq,
+      measurement.nodes[endIdx].seq,
+      payload.agent,
+      controller.signal,
+    )
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, timedOut: timedOut || payload.signal?.aborted === true, error }
+  } finally {
+    clearTimeout(timer)
+    payload.signal?.removeEventListener?.('abort', onAbort)
+  }
+}
+
+function regionTokensOf(nodes, startIdx, endIdx) {
+  let total = 0
+  for (let index = startIdx; index <= endIdx; index += 1) total += nodes[index]?.tokens ?? 0
+  return total
 }
 
 function debug(ctx, cfg, state, session, record) {
@@ -196,11 +258,31 @@ function debug(ctx, cfg, state, session, record) {
   }
 }
 
+function readPressure(ctx, session) {
+  try {
+    return ctx.tokenMeter?.contextPressure?.(session)
+  } catch {
+    return undefined
+  }
+}
+
+/** 找到第一条人类消息在表层里的位置；压缩从它之后开始，原始需求逐字保留。 */
+export function findOriginalRequestStart(session, nodes) {
+  try {
+    for (let index = 1; index < nodes.length; index += 1) {
+      const event = session.eventAt?.(nodes[index].seq)
+      if (event?.type === 'user/message' && (event.data?.source?.kind) === 'user') return index + 1
+    }
+  } catch {
+    /* 读不到事件时退回默认起点 */
+  }
+  return 1
+}
+
 /**
  * 判断这一刻要不要进入治理检查。
  * 正常只在「第 2 轮起的每轮第一步」检查；当压力超过窗口的 emergencyRatio 时，
  * 允许在一轮中间的任意步边界检查，避免长首轮把上下文推过理想水位。
- * @returns 是否检查
  */
 export function shouldCheck({ step, turn, pressure, window, emergencyRatio }) {
   if (step === 1 && Number(turn) > 1) return true
@@ -208,14 +290,6 @@ export function shouldCheck({ step, turn, pressure, window, emergencyRatio }) {
     return pressure > window * emergencyRatio
   }
   return false
-}
-
-function readPressure(ctx, session) {
-  try {
-    return ctx.tokenMeter?.contextPressure?.(session)
-  } catch {
-    return undefined
-  }
 }
 
 /**
@@ -244,10 +318,10 @@ export function evaluate({ cfg, state, nodes, pressure, window, totalTokens, sur
   const targetFree = pressure - keepBudget
   if (targetFree < workingSet) return { action: 'skip', reason: 'relief-too-small' }
 
-  // 绝对上限：单次最多释放 工作集 × maxFreeWorkSets，避免再次出现「一次删几十万」。
   const maxFree = Math.max(1, Math.min(workingSet * cfg.maxFreeWorkSets, pressure * cfg.maxFreeRatio, window * 0.5))
   const plan = chooseRegion(nodes, keepBudget, maxFree)
   if (plan === null) return { action: 'skip', reason: 'no-balanced-region' }
+  if (plan.regionTokens < cfg.minFreeTokens) return { action: 'skip', reason: 'benefit-too-small' }
   return { action: 'compact', workingSet, plan }
 }
 
